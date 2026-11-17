@@ -1,0 +1,7 @@
+# The sdist should carry everything needed to read the format and run the
+# tests, not just the module.
+include SPEC.md
+include CHANGELOG.md
+include test_jot.py
+recursive-include examples *.jot *.json
+recursive-include benchmarks *.md *.patch

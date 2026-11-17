@@ -1,0 +1,37 @@
+{
+  "service": "checkout",
+  "users": [
+    {
+      "id": 1,
+      "name": "Asha Rao",
+      "role": "admin",
+      "active": true,
+      "joined": "2025-02-27"
+    },
+    {
+      "id": 2,
+      "name": "Ravi Kumar",
+      "role": "viewer",
+      "active": false,
+      "joined": "2025-04-02"
+    },
+    {
+      "id": 3,
+      "name": "Meera Iyer",
+      "role": "editor",
+      "active": true,
+      "joined": "2025-07-02",
+      "note": "on leave"
+    }
+  ],
+  "flags": {
+    "dark_mode": {
+      "enabled": true,
+      "rollout": 80
+    },
+    "new_checkout": {
+      "enabled": false,
+      "rollout": 0
+    }
+  }
+}

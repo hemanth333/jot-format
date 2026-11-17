@@ -1,0 +1,1696 @@
+diff --git a/benchmarks/jot/jot.py b/benchmarks/jot/jot.py
+new file mode 100644
+index 0000000..52678e5
+--- /dev/null
++++ b/benchmarks/jot/jot.py
+@@ -0,0 +1,1475 @@
++#!/usr/bin/env python3
++r'''
++Jot - a human-friendly, token-efficient, JSON-compatible format.
++
++Every valid JSON file is a valid Jot file. On top of JSON, Jot adds:
++
++  * comments            # line    // line    /* block */
++  * bare keys           name: "x"      editor.fontSize: 14
++  * unquoted text       role: admin    path: C:\Users\me
++  * optional commas     newlines separate items; trailing commas are fine
++  * tables              users: [:id,name,role
++                          1,Asha,admin
++                          2,Ravi,viewer
++                        ]
++  * multiline strings   """ ... """   (common indentation is stripped)
++  * raw strings         r"C:\Users\me"   and   r""" ... """
++  * dates               2026-11-17   2026-11-17T09:30:00+05:30
++  * durations / sizes   30s  1h30m  500ms   10MB  512KiB
++  * friendlier numbers  1_000_000   0xFF   0o755   0b1010
++  * references          &name: value   then   *name   ...*name   f"${name}/path"
++  * strict rules        duplicate keys are errors; errors show line, column and a hint
++
++Library:
++    import jot
++    data = jot.loads(text)                 # Jot (or JSON) text -> Python objects
++    text = jot.dumps(data)                 # Python objects -> readable Jot
++    text = jot.dumps(data, compact=True)   # fewest tokens, for LLM prompts
++    js   = jot.to_json(text)               # Jot text -> JSON text
++
++Command line:
++    jot check config.jot
++    jot to-json config.jot -o config.json
++    jot from-json data.json --compact
++    jot tokens data.json
++'''
++
++from __future__ import annotations
++
++import argparse
++import copy
++import datetime as _dt
++import json
++import math
++import os
++import re
++import sys
++from decimal import Decimal
++
++__version__ = "0.1.0"
++__all__ = ["loads", "load", "dumps", "dump", "to_json", "from_json", "JotError"]
++
++MAX_DEPTH = 200              # deepest allowed nesting of objects/arrays
++MAX_EXPANSION = 1_000_000    # total size that references may expand to
++
++
++# --------------------------------------------------------------------------
++# Errors
++# --------------------------------------------------------------------------
++
++class JotError(ValueError):
++    """Raised for any syntax or semantic error. Carries line, column and a hint."""
++
++    def __init__(self, message, line, col, hint=None, source_line=None):
++        self.message = message
++        self.line = line
++        self.col = col
++        self.hint = hint
++        self.source_line = source_line
++        super().__init__(self._render())
++
++    def _render(self):
++        out = f"line {self.line}, col {self.col}: {self.message}"
++        if self.source_line is not None:
++            shown = self.source_line.replace("\t", " ")
++            caret = self.col - 1
++            if len(shown) > 100:                     # show a window around the error
++                start = max(0, caret - 50)
++                prefix = "..." if start else ""
++                suffix = "..." if start + 100 < len(shown) else ""
++                shown = prefix + shown[start:start + 100] + suffix
++                caret = caret - start + len(prefix)
++            out += f"\n    {shown}\n    {' ' * caret}^"
++        if self.hint:
++            out += f"\n  hint: {self.hint}"
++        return out
++
++
++# --------------------------------------------------------------------------
++# Lexical pieces
++# --------------------------------------------------------------------------
++
++_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_\-.]*")
++_KEY_SAFE = re.compile(r"[A-Za-z_][A-Za-z0-9_\-.]*\Z")
++_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
++_KEYWORDS = {"true": True, "false": False, "null": None}
++
++_DATE = re.compile(
++    r"(\d{4})-(\d{2})-(\d{2})"
++    r"(?:T(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})?)?"
++)
++_DATE_HINT = "dates look like 2026-11-17 or 2026-11-17T09:30[:00][Z|+05:30]"
++
++_HEX = re.compile(r"[+-]?0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*")
++_OCT = re.compile(r"[+-]?0[oO][0-7](?:_?[0-7])*")
++_BIN = re.compile(r"[+-]?0[bB][01](?:_?[01])*")
++_DEC = re.compile(r"[+-]?(?:0|[1-9](?:_?\d)*)(\.\d(?:_?\d)*)?([eE][+-]?\d(?:_?\d)*)?")
++_DUR = re.compile(r"[+-]?(?:\d+(?:\.\d+)?(?:us|ms|d|h|m|s))+")
++_DUR_PART = re.compile(r"(\d+(?:\.\d+)?)(us|ms|d|h|m|s)")
++_SIZE = re.compile(r"[+-]?(\d+(?:\.\d+)?)(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)")
++_DIGITS = "0123456789"
++_TABLE_START = re.compile(r"[\[{](\d*):")
++
++_DUR_ORDER = ["d", "h", "m", "s", "ms", "us"]
++_DUR_US = {"d": 86_400_000_000, "h": 3_600_000_000, "m": 60_000_000,
++           "s": 1_000_000, "ms": 1_000, "us": 1}
++_SIZE_MULT = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12,
++              "KiB": 2**10, "MiB": 2**20, "GiB": 2**30, "TiB": 2**40}
++_UNIT_HINT = ("units are ms s m h d (durations, e.g. 1h30m) or "
++              "B KB MB GB TB KiB MiB GiB TiB (sizes); for text, use quotes")
++
++_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
++            "n": "\n", "r": "\r", "t": "\t"}
++
++# characters that can't start unquoted text (they start other things)
++_BARE_BAD_START = set("0123456789+-.\"'{}[],:#*&;")
++# characters where unquoted text stops
++_BARE_STOP = set(",}];{[\"\n")
++
++_NO_SPECIAL_FLOATS = "infinity and NaN aren't supported; use null or a quoted string"
++_AMBIGUOUS = {
++    "True": "use lowercase: true",
++    "False": "use lowercase: false",
++    "TRUE": "use lowercase: true",
++    "FALSE": "use lowercase: false",
++    "None": "use null", "NULL": "use null", "Null": "use null",
++    "nil": "use null", "undefined": "use null",
++    "NaN": _NO_SPECIAL_FLOATS, "nan": _NO_SPECIAL_FLOATS,
++    "inf": _NO_SPECIAL_FLOATS, "Infinity": _NO_SPECIAL_FLOATS,
++    "infinity": _NO_SPECIAL_FLOATS,
++}
++for _w in ("yes", "no", "on", "off", "Yes", "No", "On", "Off", "YES", "NO", "ON", "OFF"):
++    _AMBIGUOUS[_w] = (f"'{_w}' is ambiguous; use true or false, "
++                      f'or quote it if you mean the text: "{_w}"')
++
++
++def _dedent_block(raw: str) -> str:
++    """Normalise the body of a triple-quoted string (see spec)."""
++    if raw.startswith("\n"):
++        raw = raw[1:]
++    lines = raw.split("\n")
++    if len(lines) > 1 and lines[-1].strip(" \t") == "":
++        lines = lines[:-1]
++    indents = [len(l) - len(l.lstrip(" \t")) for l in lines if l.strip(" \t")]
++    cut = min(indents) if indents else 0
++    return "\n".join(l[cut:] if l.strip(" \t") else "" for l in lines)
++
++
++def _flatten_fields(fields, prefix, out):
++    """Header tree -> list of leaf paths, in cell order."""
++    for name, children in fields:
++        path = prefix + (name,)
++        if children is None:
++            out.append(path)
++        else:
++            _flatten_fields(children, path, out)
++
++
++def _build_row(fields, values, prefix):
++    """Cell values by path -> nested object. Empty cells (and all-empty groups) are absent."""
++    obj = {}
++    for name, children in fields:
++        path = prefix + (name,)
++        if children is None:
++            if path in values:
++                obj[name] = values[path]
++        else:
++            sub = _build_row(children, values, path)
++            if sub:
++                obj[name] = sub
++    return obj
++
++
++def _size_of(v) -> int:
++    """Rough size of a value: one per node plus string lengths. Iterative."""
++    total, stack = 0, [v]
++    while stack:
++        x = stack.pop()
++        total += 1
++        if isinstance(x, str):
++            total += len(x)
++        elif isinstance(x, dict):
++            for k, y in x.items():
++                total += len(k)
++                stack.append(y)
++        elif isinstance(x, list):
++            stack.extend(x)
++    return total
++
++
++# --------------------------------------------------------------------------
++# Parser
++# --------------------------------------------------------------------------
++
++class _Parser:
++    def __init__(self, text, env=False, max_depth=MAX_DEPTH, max_expansion=MAX_EXPANSION):
++        if text.startswith("\ufeff"):
++            text = text[1:]
++        self.s = text.replace("\r\n", "\n")
++        self.n = len(self.s)
++        self.i = 0
++        self.refs = {}             # name -> (value, position, size)
++        self.env = env
++        self.max_depth = max_depth
++        self.max_expansion = max_expansion
++        self.depth = 0
++        self.expanded = 0
++        self.in_cell = 0
++        self._lines = None
++
++    # ---- error helpers ---------------------------------------------------
++
++    def _lc(self, i):
++        line = self.s.count("\n", 0, i) + 1
++        col = i - (self.s.rfind("\n", 0, i) + 1) + 1
++        return line, col
++
++    def where(self, i):
++        line, col = self._lc(i)
++        return f"line {line}, col {col}"
++
++    def error(self, msg, at=None, hint=None):
++        at = self.i if at is None else min(at, self.n)
++        line, col = self._lc(at)
++        if self._lines is None:
++            self._lines = self.s.split("\n")
++        src = self._lines[line - 1] if line - 1 < len(self._lines) else ""
++        raise JotError(msg, line, col, hint, src)
++
++    def _unclosed(self, opener, open_at):
++        closer = "}" if opener == "{" else "]"
++        self.error(f"'{opener}' is never closed", open_at,
++                   hint=f"add a matching '{closer}' before the end of the file")
++
++    def _mismatch(self, found, opener, open_at):
++        closer = "}" if opener == "{" else "]"
++        self.error(f"found '{found}' but the '{opener}' opened at "
++                   f"{self.where(open_at)} needs '{closer}'",
++                   hint="check for a missing or extra bracket")
++
++    def _ref_hint(self, name):
++        if self.refs:
++            known = ", ".join(sorted(self.refs))
++            return f"known references: {known} (they must be defined before use)"
++        return f"define it earlier in the file with  &{name}: value"
++
++    def _enter(self, at):
++        self.depth += 1
++        if self.depth > self.max_depth:
++            self.error(f"nesting is too deep (more than {self.max_depth} levels)", at,
++                       hint="flatten the structure")
++
++    def _spend(self, amount, at):
++        self.expanded += amount
++        if self.expanded > self.max_expansion:
++            self.error("references expand to too much data", at,
++                       hint=f"the limit is {self.max_expansion:,} units; this protects against "
++                            "files that blow up in memory (pass max_expansion= to raise it)")
++
++    # ---- low level -------------------------------------------------------
++
++    def peek(self):
++        return self.s[self.i] if self.i < self.n else ""
++
++    def skip_ws(self) -> bool:
++        """Skip whitespace and comments. Returns True if a newline was crossed."""
++        s, n = self.s, self.n
++        newline = False
++        while self.i < n:
++            c = s[self.i]
++            if c == "\n":
++                newline = True
++                self.i += 1
++            elif c in " \t\r":
++                self.i += 1
++            elif c == "#" or s.startswith("//", self.i):
++                j = s.find("\n", self.i)
++                self.i = n if j < 0 else j
++            elif s.startswith("/*", self.i):
++                j = s.find("*/", self.i + 2)
++                if j < 0:
++                    self.error("block comment is never closed", hint="close it with */")
++                if "\n" in s[self.i:j]:
++                    newline = True
++                self.i = j + 2
++            else:
++                break
++        return newline
++
++    def skip_inline(self):
++        """Skip spaces, tabs and comments, but stop before a newline."""
++        s, n = self.s, self.n
++        while self.i < n:
++            c = s[self.i]
++            if c in " \t\r":
++                self.i += 1
++            elif c == "#" or s.startswith("//", self.i):
++                j = s.find("\n", self.i)
++                self.i = n if j < 0 else j
++            elif s.startswith("/*", self.i):
++                j = s.find("*/", self.i + 2)
++                if j < 0:
++                    self.error("block comment is never closed", hint="close it with */")
++                if "\n" in s[self.i:j]:
++                    self.error("a block comment inside a table row must stay on one line")
++                self.i = j + 2
++            else:
++                break
++
++    def _entry_ahead(self, strict) -> bool:
++        """Look ahead: does the text at the cursor look like  key:  ?
++
++        strict=True requires whitespace or end of line after the ':' so that
++        unquoted text like  https://x  isn't mistaken for a key.
++        """
++        save = self.i
++        try:
++            c = self.peek()
++            if c == "&" or self.s.startswith("...", self.i):
++                return True
++            if c == '"':
++                try:
++                    self._scan_line_string("")
++                except JotError:
++                    return False
++            else:
++                m = _IDENT.match(self.s, self.i)
++                if not m:
++                    return False
++                self.i = m.end()
++            if strict:
++                while self.peek() in (" ", "\t"):
++                    self.i += 1
++                if self.peek() != ":":
++                    return False
++                nxt = self.s[self.i + 1] if self.i + 1 < self.n else ""
++                return nxt in ("", " ", "\t", "\n")
++            self.skip_ws()
++            return self.peek() in (":", "=")   # '=' gets a helpful error later
++        finally:
++            self.i = save
++
++    # ---- document --------------------------------------------------------
++
++    def parse_document(self):
++        self.skip_ws()
++        if self.i >= self.n:
++            return {}
++        if self._entry_ahead(strict=False):
++            return self.parse_members(None, None)
++        value = self.parse_value()
++        self.skip_ws()
++        if self.i < self.n:
++            self.error("unexpected content after the top-level value",
++                       hint="a file holds one value; for several settings write  key: value  lines")
++        return value
++
++    # ---- objects ---------------------------------------------------------
++
++    def parse_object(self):
++        if _TABLE_START.match(self.s, self.i):
++            return self.parse_keyed_table()
++        open_at = self.i
++        self._enter(open_at)
++        self.i += 1
++        obj = self.parse_members("}", open_at)
++        self.depth -= 1
++        return obj
++
++    def parse_members(self, close, open_at):
++        obj, key_pos = {}, {}
++        first, sep = True, False
++        while True:
++            if self.skip_ws():
++                sep = True
++            c = self.peek()
++            if c == "":
++                if close is None:
++                    return obj
++                self._unclosed("{", open_at)
++            if c == close:
++                self.i += 1
++                return obj
++            if c in "}]":
++                if close is None:
++                    self.error(f"unmatched '{c}'", hint="there's no opening bracket for this")
++                self._mismatch(c, "{", open_at)
++            if c == ",":
++                self.error("unexpected comma", hint="remove the extra comma")
++            if not first and not sep:
++                self.error("expected a comma or a new line between entries",
++                           hint="put each entry on its own line, or separate them with commas")
++            if self.s.startswith("...", self.i):
++                self._spread_into_object(obj)
++            else:
++                self._parse_entry(obj, key_pos)
++            first = False
++            sep = self.skip_ws()
++            if self.peek() == ",":
++                self.i += 1
++                sep = True
++
++    def parse_key(self):
++        at, c = self.i, self.peek()
++        if c == '"':
++            return self._scan_line_string(""), at
++        m = _IDENT.match(self.s, self.i)
++        if m:
++            self.i = m.end()
++            return m.group(), at
++        if c == "'":
++            self.error("single quotes aren't allowed", hint='use double quotes: "key"')
++        if c in _DIGITS:
++            self.error("bare keys can't start with a digit", hint="wrap the key in double quotes")
++        self.error(f"expected a key, found {c!r}",
++                   hint='keys are bare words (letters, digits, _ - .) or "quoted strings"')
++
++    def _parse_entry(self, obj, key_pos):
++        at = self.i
++        is_ref = self.peek() == "&"
++        if is_ref:
++            self.i += 1
++            m = _IDENT.match(self.s, self.i)
++            if not m:
++                self.error("expected a reference name after '&'",
++                           hint='for example  &base_url: "https://example.com"')
++            name = m.group()
++            self.i = m.end()
++        else:
++            name, at = self.parse_key()
++        self.skip_ws()
++        c = self.peek()
++        if c != ":":
++            hint = "use ':' instead of '='" if c == "=" else f"write  {name}: value"
++            self.error(f"expected ':' after '{name}'", hint=hint)
++        self.i += 1
++        self.skip_ws()
++        if self.peek() in ("", "}", "]", ",") or self._entry_ahead(strict=True):
++            self.error(f"missing value for '{name}'", hint="put a value after the ':', or use null")
++        value = self.parse_value()
++        if is_ref:
++            if name in self.refs:
++                self.error(f"reference '&{name}' is already defined", at,
++                           hint=f"first defined at {self.where(self.refs[name][1])}")
++            self.refs[name] = (value, at, _size_of(value))
++        else:
++            if name in key_pos:
++                self.error(f"duplicate key '{name}'", at,
++                           hint=f"first defined at {self.where(key_pos[name])}; remove or rename one")
++            obj[name] = value
++            key_pos[name] = at
++
++    def _spread(self):
++        at = self.i
++        self.i += 3
++        if self.peek() != "*":
++            self.error("expected a reference after '...'", hint="write  ...*name")
++        return self.parse_ref_use(), at
++
++    def _spread_into_object(self, obj):
++        value, at = self._spread()
++        if not isinstance(value, dict):
++            self.error("only an object can be spread into an object", at)
++        obj.update(value)      # later entries win
++
++    # ---- arrays and tables -----------------------------------------------
++
++    def parse_array(self):
++        if _TABLE_START.match(self.s, self.i):
++            return self.parse_table()
++        open_at = self.i
++        self._enter(open_at)
++        self.i += 1
++        arr = []
++        first, sep = True, False
++        while True:
++            if self.skip_ws():
++                sep = True
++            c = self.peek()
++            if c == "":
++                self._unclosed("[", open_at)
++            if c == "]":
++                self.i += 1
++                self.depth -= 1
++                return arr
++            if c == "}":
++                self._mismatch(c, "[", open_at)
++            if c == ",":
++                self.error("unexpected comma", hint="remove the extra comma")
++            if not first and not sep:
++                self.error("expected a comma or a new line between items",
++                           hint="put each item on its own line, or separate them with commas")
++            if c == "&":
++                self.error("references can only be defined inside objects",
++                           hint="move  &name: value  to an object, such as the top level")
++            if self.s.startswith("...", self.i):
++                value, at = self._spread()
++                if not isinstance(value, list):
++                    self.error("only an array can be spread into an array", at)
++                arr.extend(value)
++            else:
++                if self._entry_ahead(strict=True):
++                    self.error(f"found a 'key:' inside the '[' opened at {self.where(open_at)}",
++                               hint="is a closing ']' missing above this line?")
++                arr.append(self.parse_value())
++            first = False
++            sep = self.skip_ws()
++            if self.peek() == ",":
++                self.i += 1
++                sep = True
++
++    def parse_table(self):
++        """[:header  rows  ]  -> list of objects"""
++        return self._parse_table_body(keyed=False)
++
++    def parse_keyed_table(self):
++        """{:header  key: cells  }  -> object of objects"""
++        return self._parse_table_body(keyed=True)
++
++    def _parse_table_body(self, keyed):
++        open_at = self.i
++        opener, closer = ("{", "}") if keyed else ("[", "]")
++        self._enter(open_at)
++        m = _TABLE_START.match(self.s, self.i)
++        declared = int(m.group(1)) if m.group(1) else None
++        self.i = m.end()
++        fields = self._parse_fields(top=True, closer=closer)
++        if not fields:
++            self.error("a table needs at least one field name", open_at,
++                       hint=f"write the header like  {opener}:id,name,role")
++        leaves = []
++        _flatten_fields(fields, (), leaves)
++        result = {} if keyed else []
++        key_pos = {}
++        while True:
++            while True:
++                self.skip_ws()
++                if self.peek() == ";":
++                    self.i += 1
++                    continue
++                break
++            c = self.peek()
++            if c == "":
++                self._unclosed(opener, open_at)
++            if c == closer:
++                if declared is not None and len(result) != declared:
++                    what = "missing" if len(result) < declared else "extra"
++                    self.error(f"table declares {declared} rows but has {len(result)}", open_at,
++                               hint=f"rows are {what}: the data may have been cut off or edited; "
++                                    "fix the rows or the count")
++                self.i += 1
++                self.depth -= 1
++                return result
++            if c in "]}":
++                self._mismatch(c, opener, open_at)
++            if keyed:
++                name, at = self.parse_key()
++                if name in key_pos:
++                    self.error(f"duplicate key '{name}'", at,
++                               hint=f"first defined at {self.where(key_pos[name])}")
++                key_pos[name] = at
++                self.skip_inline()
++                if self.peek() != ":":
++                    self.error(f"expected ':' after '{name}'",
++                               hint="each row of a keyed table is  key: cell,cell,...")
++                self.i += 1
++                result[name] = self._parse_row(fields, leaves, closer)
++            else:
++                result.append(self._parse_row(fields, leaves, closer))
++
++    def _parse_fields(self, top, closer):
++        """Header fields. A field is a key, or a group  key{field,field}."""
++        fields, seen = [], {}
++        ends = ("\n", ";", closer, "")
++        while True:
++            self.skip_inline()
++            c = self.peek()
++            if top and c in ends:
++                return fields
++            if not top and c == "}":
++                self.i += 1
++                return fields
++            name, at = self.parse_key()
++            if name in seen:
++                self.error(f"duplicate field '{name}' in table header", at)
++            seen[name] = at
++            self.skip_inline()
++            children = None
++            if self.peek() == "{":
++                group_at = self.i
++                self.i += 1
++                children = self._parse_fields(top=False, closer=closer)
++                if not children:
++                    self.error("a field group needs at least one field", group_at,
++                               hint="write it like  address{city,country}")
++                self.skip_inline()
++            fields.append((name, children))
++            c = self.peek()
++            if c == ",":
++                self.i += 1
++                continue
++            if top and c in ends:
++                return fields
++            if not top and c == "}":
++                self.i += 1
++                return fields
++            what = "the end of the header line" if top else "'}' to close the field group"
++            self.error(f"expected ',' or {what}",
++                       hint="the header lists field names:  [:id,name,address{city,country}")
++
++    def _parse_row(self, fields, leaves, closer):
++        row_at = self.i
++        values = {}
++        last = len(leaves) - 1
++        ends = ("\n", ";", closer, "")
++        for idx, path in enumerate(leaves):
++            self.skip_inline()
++            c = self.peek()
++            if c != "," and c not in ends:
++                self.in_cell += 1
++                values[path] = self.parse_value()
++                self.in_cell -= 1
++                self.skip_inline()
++                c = self.peek()
++            if idx < last:
++                if c != ",":
++                    self.error(f"this row has {idx + 1} value(s) but the header has "
++                               f"{len(leaves)} columns", row_at,
++                               hint="leave a cell empty (just a comma) when a value is missing")
++                self.i += 1
++            elif c == ",":
++                self.error(f"this row has more values than the {len(leaves)} header columns",
++                           self.i, hint="remove the extra value, or add a field to the header")
++            elif c not in ends:
++                self.error("unexpected text at the end of the row")
++        return _build_row(fields, values, ())
++
++    # ---- values ----------------------------------------------------------
++
++    def parse_value(self):
++        s, c = self.s, self.peek()
++        if c == "{":
++            return self.parse_object()
++        if c == "[":
++            return self.parse_array()
++        if s.startswith("...", self.i):
++            self.error("'...*name' can only be used as an entry in an object or array")
++        if c == '"':
++            value = self.parse_string("")
++        elif c in ("r", "f") and s.startswith('"', self.i + 1):
++            self.i += 1
++            value = self.parse_string(c)
++        elif c == "*":
++            value = self.parse_ref_use()
++        elif c == "'":
++            self.error("single quotes aren't allowed", hint='use double quotes: "text"')
++        elif c in _DIGITS or c in ("+", "-"):
++            value = self.parse_number_or_date()
++        elif c == ".":
++            self.error("numbers need a digit before the dot",
++                       hint='write 0.5 instead of .5; for text, use quotes')
++        elif c == "":
++            self.error("expected a value but reached the end of the file")
++        elif c in "}],;":
++            self.error("missing value", hint="put a value here, or use null")
++        elif c == ":":
++            self.error("unexpected ':'", hint="is a key missing before it?")
++        else:
++            value = self.parse_bare()
++        self._check_value_end()
++        return value
++
++    def _check_value_end(self):
++        """After a scalar, only a separator, closer or comment may follow on the line."""
++        s, j = self.s, self.i
++        while j < self.n and s[j] in " \t":
++            j += 1
++        if j >= self.n:
++            return
++        c = s[j]
++        if c in "\n,}];#" or s.startswith("//", j) or s.startswith("/*", j):
++            return
++        self.error("unexpected text after this value", j,
++                   hint="if it's all one piece of text, wrap it in double quotes; "
++                        "if these are separate items, separate them with commas or new lines")
++
++    def parse_bare(self):
++        """Unquoted text: runs to the end of the line, a separator, or a comment."""
++        s, n = self.s, self.n
++        start = j = self.i
++        while j < n:
++            ch = s[j]
++            if ch in _BARE_STOP:
++                break
++            if ch in " \t" and j + 1 < n and (s[j + 1] == "#" or s.startswith("//", j + 1)
++                                              or s.startswith("/*", j + 1)):
++                break
++            if ch == ":" and (j + 1 >= n or s[j + 1] in " \t\n"):
++                self.error("unquoted text can't contain ': '", j,
++                           hint="wrap the value in double quotes, or check for a missing "
++                                "comma or new line before the next key")
++            if ord(ch) < 0x20 and ch != "\t":
++                self.error("control character in text", j)
++            j += 1
++        stop = s[j] if j < n else ""
++        if stop in ('{', '[', '"'):
++            self.error(f"'{stop}' can't appear in unquoted text", j,
++                       hint="wrap the whole value in double quotes")
++        if stop == ";" and not self.in_cell:
++            self.error("';' can't appear in unquoted text", j,
++                       hint="wrap the whole value in double quotes")
++        text = s[start:j].rstrip(" \t")
++        if text in _KEYWORDS:
++            self.i = start + len(text)
++            return _KEYWORDS[text]
++        first = text.split(" ", 1)[0].split("\t", 1)[0]
++        if first in _KEYWORDS:
++            self.error(f"text starting with '{first}' needs quotes", start,
++                       hint=f'write "{text}"')
++        if text in _AMBIGUOUS:
++            self.error(f"'{text}' isn't a valid value", start, hint=_AMBIGUOUS[text])
++        self.i = start + len(text)
++        return text
++
++    def parse_ref_use(self):
++        at = self.i
++        self.i += 1
++        m = _IDENT.match(self.s, self.i)
++        if not m:
++            self.error("expected a reference name after '*'", hint="for example  *base_url")
++        name = m.group()
++        if name not in self.refs:
++            self.error(f"unknown reference '{name}'", at, hint=self._ref_hint(name))
++        self.i = m.end()
++        value, _, size = self.refs[name]
++        self._spend(size, at)
++        return copy.deepcopy(value)
++
++    # ---- strings ---------------------------------------------------------
++
++    def parse_string(self, kind):
++        if self.s.startswith('"""', self.i):
++            return self._scan_block_string(kind)
++        return self._scan_line_string(kind)
++
++    def _scan_line_string(self, kind):
++        open_at = self.i
++        self.i += 1
++        s, n = self.s, self.n
++        j = self.i
++        unterminated = 'close it with " (for text across several lines use """ ... """)'
++        while True:
++            if j >= n or s[j] == "\n":
++                self.error("string is never closed", open_at, hint=unterminated)
++            ch = s[j]
++            if ch == '"':
++                break
++            if ch == "\\" and kind != "r":
++                if j + 1 < n and s[j + 1] != "\n":
++                    j += 2
++                    continue
++                self.error("string is never closed", open_at, hint=unterminated)
++            if ord(ch) < 0x20 and ch != "\t":
++                self.error("control character inside a string", j,
++                           hint=r"write it as an escape such as \n or \u0001")
++            j += 1
++        content = s[self.i:j]
++        base = self.i
++        self.i = j + 1
++        if kind == "r":
++            return content
++        return self._unescape(content, kind, base, exact=True)
++
++    def _scan_block_string(self, kind):
++        open_at = self.i
++        self.i += 3
++        s, n = self.s, self.n
++        j = self.i
++        if kind == "r":
++            j = s.find('"""', j)
++            if j < 0:
++                self.error("multiline string is never closed", open_at, hint='close it with """')
++        else:
++            while True:
++                if j >= n:
++                    self.error("multiline string is never closed", open_at, hint='close it with """')
++                if s[j] == "\\":
++                    j += 2
++                    continue
++                if s.startswith('"""', j):
++                    break
++                j += 1
++        raw = s[self.i:j]
++        self.i = j + 3
++        text = _dedent_block(raw)
++        if kind == "r":
++            return text
++        return self._unescape(text, kind, open_at, exact=False)
++
++    def _unescape(self, text, kind, base, exact):
++        out = []
++        k, n = 0, len(text)
++        hexd = "0123456789abcdefABCDEF"
++
++        def err(msg, off, hint=None):
++            self.error(msg, base + off if exact else base, hint)
++
++        while k < n:
++            c = text[k]
++            if c == "\\":
++                e = text[k + 1] if k + 1 < n else ""
++                if e and e in _ESCAPES:
++                    out.append(_ESCAPES[e])
++                    k += 2
++                elif e == "\n":                       # line continuation
++                    k += 2
++                    while k < n and text[k] in " \t":
++                        k += 1
++                elif e == "$" and kind == "f":
++                    out.append("$")
++                    k += 2
++                elif e == "u":
++                    hex4 = text[k + 2:k + 6]
++                    if len(hex4) != 4 or not all(h in hexd for h in hex4):
++                        err("bad \\u escape", k, hint=r"use exactly four hex digits, like \u00e9")
++                    cp = int(hex4, 16)
++                    k += 6
++                    if 0xD800 <= cp <= 0xDBFF and text.startswith("\\u", k):
++                        low_hex = text[k + 2:k + 6]
++                        if len(low_hex) == 4 and all(h in hexd for h in low_hex):
++                            low = int(low_hex, 16)
++                            if 0xDC00 <= low <= 0xDFFF:
++                                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
++                                k += 6
++                    out.append(chr(cp))
++                else:
++                    shown = e if e else "(end)"
++                    err(f"unknown escape '\\{shown}'", k,
++                        hint=r'write \\ for a backslash, or use a raw string: r"C:\path"')
++            elif kind == "f" and text.startswith("${", k):
++                end = text.find("}", k + 2)
++                if end < 0:
++                    err("'${' is never closed in f-string", k, hint="close it with }")
++                name = text[k + 2:end].strip()
++                piece = self._interp_value(name, base + k if exact else base)
++                self._spend(len(piece), base)
++                out.append(piece)
++                k = end + 1
++            else:
++                out.append(c)
++                k += 1
++        return "".join(out)
++
++    def _interp_value(self, name, at):
++        if name.startswith("env:"):
++            var = name[4:]
++            if not _ENV_NAME.match(var):
++                self.error(f"invalid environment variable name '{var}'", at)
++            if not self.env:
++                self.error("environment variables are turned off", at,
++                           hint="use jot.loads(text, env=True), or --env on the command line")
++            if var not in os.environ:
++                self.error(f"environment variable '{var}' is not set", at)
++            return os.environ[var]
++        if not _IDENT.fullmatch(name):
++            self.error(f"invalid reference name '{name}' in f-string", at,
++                       hint="use ${name}; for a literal dollar sign write \\$")
++        if name not in self.refs:
++            self.error(f"unknown reference '{name}'", at, hint=self._ref_hint(name))
++        v = self.refs[name][0]
++        if isinstance(v, bool):
++            return "true" if v else "false"
++        if v is None:
++            return "null"
++        if isinstance(v, _dt.timedelta):
++            return _format_duration(v)
++        if isinstance(v, _dt.date):
++            return v.isoformat()
++        if isinstance(v, (int, float, str)):
++            return str(v)
++        what = "an object" if isinstance(v, dict) else "an array"
++        self.error(f"can't put {what} inside a string", at,
++                   hint=f"use  *{name}  as a whole value instead")
++
++    # ---- numbers, dates, durations, sizes --------------------------------
++
++    def parse_number_or_date(self):
++        s, start = self.s, self.i
++        if s[start] in _DIGITS:
++            m = _DATE.match(s, start)
++            if m:
++                return self._finish_date(m)
++        for rx in (_HEX, _OCT, _BIN):
++            m = rx.match(s, start)
++            if m:
++                self.i = m.end()
++                self._check_number_end(start)
++                return int(m.group().replace("_", ""), 0)
++        m = _DEC.match(s, start)
++        if not m:
++            hint = None
++            if re.match(r"[+-]?(inf|Infinity|nan|NaN)", s[start:start + 10]):
++                hint = _NO_SPECIAL_FLOATS
++            elif s[start] == "-":
++                hint = 'text starting with "-" needs quotes'
++            self.error("invalid number", start, hint)
++        end = m.end()
++        if end < self.n and s[end].isalpha() and s[end] not in "eE":
++            return self._parse_unit(start)
++        if end < self.n and s[end] in "eE" and not m.group(2):
++            return self._parse_unit(start)
++        self.i = end
++        self._check_number_end(start)
++        txt = m.group().replace("_", "")
++        if m.group(1) or m.group(2):
++            val = float(txt)
++            if math.isinf(val):
++                self.error("number is too large", start)
++            return val
++        return int(txt)
++
++    def _parse_unit(self, start):
++        s = self.s
++        m = _SIZE.match(s, start)
++        if m and not self._word_continues(m.end()):
++            self.i = m.end()
++            amount = Decimal(m.group(1)) * _SIZE_MULT[m.group(2)]
++            if amount != amount.to_integral_value():
++                self.error("a size must come out to a whole number of bytes", start)
++            return int(amount) * (-1 if s[start] == "-" else 1)
++        m = _DUR.match(s, start)
++        if m and not self._word_continues(m.end()):
++            tok = m.group()
++            parts = _DUR_PART.findall(tok)
++            order = [_DUR_ORDER.index(u) for _, u in parts]
++            if order != sorted(set(order)):
++                self.error("duration units must go from largest to smallest, each used once",
++                           start, hint="for example  1h30m  or  2s500ms")
++            total = sum(Decimal(num) * _DUR_US[u] for num, u in parts)
++            if tok.startswith("-"):
++                total = -total
++            self.i = m.end()
++            return _dt.timedelta(microseconds=int(total))
++        hint = _UNIT_HINT
++        if re.match(r"[+-]?[\d.]+[kmgt]i?b\b", s[start:start + 20], re.I):
++            hint = "size units are case-sensitive: B KB MB GB TB KiB MiB GiB TiB"
++        self.error("unknown unit after number", start, hint)
++
++    def _word_continues(self, j):
++        return j < self.n and (self.s[j].isalnum() or self.s[j] in "_.")
++
++    def _check_number_end(self, start):
++        nxt = self.peek()
++        if nxt and (nxt.isalnum() or nxt in "_."):
++            tok = self.s[start:self.i]
++            if nxt in _DIGITS and tok.lstrip("+-") == "0":
++                hint = 'leading zeros aren\'t allowed; drop them, or quote it: "007"'
++            elif nxt == "." and "." in tok:
++                hint = 'a number has at most one dot; versions and IPs need quotes: "1.4.2"'
++            elif nxt == ".":
++                hint = "a number can't end with a dot; write 1.0 or 1"
++            elif nxt == "_":
++                hint = "underscores go between digits: 1_000_000"
++            else:
++                hint = "if this is text, wrap it in double quotes"
++            self.error("invalid number", start, hint)
++
++    def _finish_date(self, m):
++        start = self.i
++        y, mo, d, hh, mi, ss, frac, tz = m.groups()
++        try:
++            if hh is None:
++                val = _dt.date(int(y), int(mo), int(d))
++            else:
++                us = int((frac[1:] + "000000")[:6]) if frac else 0
++                tzinfo = None
++                if tz == "Z":
++                    tzinfo = _dt.timezone.utc
++                elif tz:
++                    sign = 1 if tz[0] == "+" else -1
++                    tzinfo = _dt.timezone(sign * _dt.timedelta(hours=int(tz[1:3]),
++                                                               minutes=int(tz[4:6])))
++                val = _dt.datetime(int(y), int(mo), int(d), int(hh), int(mi),
++                                   int(ss or 0), us, tzinfo)
++        except ValueError as e:
++            self.error(f"invalid date: {e}", start, hint=_DATE_HINT)
++        self.i = m.end()
++        nxt = self.peek()
++        if hh is None and re.match(r" \d{2}:\d{2}", self.s[self.i:self.i + 6]):
++            self.error("date and time must be joined with 'T'", self.i,
++                       hint="write 2026-11-17T10:30, not 2026-11-17 10:30")
++        if nxt and (nxt.isalnum() or nxt in ":._"):
++            self.error("invalid date or time", start, hint=_DATE_HINT)
++        return val
++
++
++# --------------------------------------------------------------------------
++# Writer
++# --------------------------------------------------------------------------
++
++def _format_duration(td: _dt.timedelta) -> str:
++    total = td // _dt.timedelta(microseconds=1)
++    if total == 0:
++        return "0s"
++    sign = "-" if total < 0 else ""
++    total = abs(total)
++    parts = []
++    for unit in _DUR_ORDER:
++        q, total = divmod(total, _DUR_US[unit])
++        if q:
++            parts.append(f"{q}{unit}")
++    return sign + "".join(parts)
++
++
++def _dt_text(v) -> str:
++    """ISO-8601 text for a date/datetime, in the style JSON producers usually use:
++    'Z' for UTC, and milliseconds when the fraction is whole milliseconds."""
++    if isinstance(v, _dt.datetime):
++        if v.microsecond == 0:
++            spec = "seconds"
++        elif v.microsecond % 1000 == 0:
++            spec = "milliseconds"
++        else:
++            spec = "microseconds"
++        out = v.isoformat(timespec=spec)
++        if v.tzinfo is not None and v.utcoffset() == _dt.timedelta(0) and out.endswith("+00:00"):
++            out = out[:-6] + "Z"
++        return out
++    return v.isoformat()
++
++
++def _date_string_ok(s: str) -> bool:
++    """Would this JSON string survive as an unquoted Jot date (Jot -> JSON gives it back)?"""
++    if not _DATE.fullmatch(s):
++        return False
++    try:
++        v = _Parser(s).parse_document()
++    except JotError:
++        return False
++    return isinstance(v, _dt.date) and _dt_text(v) == s
++
++
++def _bare_ok(s: str) -> bool:
++    """Can this string be written without quotes and read back unchanged?"""
++    if not s or s != s.strip() or s[0] in _BARE_BAD_START:
++        return False
++    if s.startswith("//") or s.startswith("/*"):
++        return False
++    for ch in s:
++        if ch in _BARE_STOP or ord(ch) < 0x20 or ch == "\t":
++            return False
++    if " #" in s or " //" in s or " /*" in s or ": " in s or s.endswith(":"):
++        return False
++    first = s.split(" ", 1)[0]
++    if first in _KEYWORDS or s in _AMBIGUOUS:
++        return False
++    return True
++
++
++def _dump_string(s, w, depth, in_cell=False):
++    if w.bare and _bare_ok(s):
++        return s
++    if w.native_dates and _date_string_ok(s):
++        return s
++    if not in_cell and "\n" in s and "\r" not in s:
++        lines = s.split("\n")
++        nonblank = [l for l in lines if l.strip(" \t")]
++        flush_left = any(l[0] not in " \t" for l in nonblank)
++        no_ws_only = all(l == "" or l.strip(" \t") for l in lines)
++        if nonblank and flush_left and no_ws_only:
++            inner = w.pad * (depth + 1)
++            body = []
++            for l in lines:
++                esc = l.replace("\\", "\\\\").replace('"""', '""\\"')
++                esc = "".join(ch if ord(ch) >= 0x20 or ch == "\t" else f"\\u{ord(ch):04x}"
++                              for ch in esc)
++                body.append(inner + esc if esc else "")
++            return '"""\n' + "\n".join(body) + "\n" + inner + '"""'
++    return json.dumps(s, ensure_ascii=False)
++
++
++def _get_path(obj, path):
++    for name in path:
++        if not isinstance(obj, dict) or name not in obj:
++            return False, None
++        obj = obj[name]
++    return True, obj
++
++
++class _Writer:
++    def __init__(self, indent, bare, tables, compact, native_dates, inline_width, counts,
++                 nested_cells):
++        self.counts = counts
++        self.nested_cells = nested_cells
++        self.pad = " " * indent
++        self.bare = bare
++        self.tables = tables
++        self.compact = compact
++        self.native_dates = native_dates
++        self.inline_width = inline_width
++        self.kv = ":" if compact else ": "
++
++    # ---- pieces ----------------------------------------------------------
++
++    def key(self, k):
++        if not isinstance(k, str):
++            raise TypeError(f"keys must be strings, got {type(k).__name__}")
++        if _KEY_SAFE.match(k) and k not in _KEYWORDS:
++            return k
++        return json.dumps(k, ensure_ascii=False)
++
++    def scalar(self, v, depth, in_cell=False):
++        if v is None:
++            return "null"
++        if v is True:
++            return "true"
++        if v is False:
++            return "false"
++        if isinstance(v, int):
++            return str(v)
++        if isinstance(v, float):
++            if math.isnan(v) or math.isinf(v):
++                raise ValueError("Jot can't represent NaN or infinity")
++            return repr(v)
++        if isinstance(v, (_dt.datetime, _dt.date)):
++            return _dt_text(v)
++        if isinstance(v, _dt.timedelta):
++            return _format_duration(v)
++        if isinstance(v, str):
++            return _dump_string(v, self, depth, in_cell)
++        raise TypeError(f"Jot can't represent values of type {type(v).__name__}")
++
++    # ---- tables ----------------------------------------------------------
++
++    def _analyze(self, rows):
++        """Header fields for a list of objects, or None if they don't fit a table.
++        Keys whose values are always non-empty objects become field groups."""
++        keys, seen = [], set()
++        for r in rows:
++            for k in r:
++                if k not in seen:
++                    seen.add(k)
++                    keys.append(k)
++        fields = []
++        for k in keys:
++            vals = [r[k] for r in rows if k in r]
++            if all(isinstance(v, dict) and v for v in vals):
++                sub = self._analyze(vals)
++                if sub is not None:
++                    fields.append((k, sub))
++                    continue
++            if not self.nested_cells and any(isinstance(v, (dict, list, tuple)) for v in vals):
++                return None   # keep cells simple: no objects or lists inside a cell
++            fields.append((k, None))
++        return fields
++
++    def table_shape(self, rows):
++        if not self.tables or len(rows) < 2 or not all(isinstance(x, dict) and x for x in rows):
++            return None
++        fields = self._analyze(rows)
++        if not fields:
++            return None
++        leaves = []
++        _flatten_fields(fields, (), leaves)
++        filled = sum(1 for r in rows for p in leaves if _get_path(r, p)[0])
++        if filled < 0.6 * len(rows) * len(leaves):
++            return None
++        return fields, leaves
++
++    def header(self, fields):
++        return ",".join(self.key(n) + ("" if c is None else "{" + self.header(c) + "}")
++                        for n, c in fields)
++
++    def cells(self, row, leaves, depth):
++        out = []
++        for p in leaves:
++            ok, v = _get_path(row, p)
++            out.append(self.inline(v, depth) if ok else "")
++        return ",".join(out)
++
++    # ---- values ----------------------------------------------------------
++
++    def inline(self, v, depth):
++        """Single-line form of any value (used in table cells and compact mode)."""
++        if isinstance(v, dict):
++            if not v:
++                return "{}"
++            shape = self.table_shape(list(v.values()))
++            if shape:
++                fields, leaves = shape
++                rows = [f"{self.key(k)}:{self.cells(x, leaves, depth)}" for k, x in v.items()]
++                return "{" + self.count(v, True) + ":" + self.header(fields) + ";" + ";".join(rows) + "}"
++            return "{" + ",".join(f"{self.key(k)}:{self.inline(x, depth)}"
++                                  for k, x in v.items()) + "}"
++        if isinstance(v, (list, tuple)):
++            if not v:
++                return "[]"
++            shape = self.table_shape(v)
++            if shape:
++                fields, leaves = shape
++                return ("[" + self.count(v, True) + ":" + self.header(fields) + ";" +
++                        ";".join(self.cells(x, leaves, depth) for x in v) + "]")
++            return "[" + ",".join(self.inline(x, depth) for x in v) + "]"
++        return self.scalar(v, depth, in_cell=True)
++
++    def value(self, v, depth):
++        inner = self.pad * (depth + 1)
++        close = "" if (self.compact and self.nested_cells) else self.pad * depth
++        if isinstance(v, dict):
++            if not v:
++                return "{}"
++            shape = self.table_shape(list(v.values()))
++            if shape:
++                fields, leaves = shape
++                rows = [f"{inner}{self.key(k)}{self.kv}{self.cells(x, leaves, depth)}"
++                        for k, x in v.items()]
++                return ("{" + self.count(v) + ":" + self.header(fields) + "\n" + "\n".join(rows)
++                        + "\n" + close + "}")
++            if self.inline_width:
++                s = self.inline(v, depth)
++                if len(s) <= self.inline_width:
++                    return s
++            return "{\n" + "\n".join(self.members(v, depth + 1)) + "\n" + close + "}"
++        if isinstance(v, (list, tuple)):
++            if not v:
++                return "[]"
++            shape = self.table_shape(v)
++            if shape:
++                fields, leaves = shape
++                rows = [self.indent(inner, self.cells(x, leaves, depth)) for x in v]
++                return ("[" + self.count(v) + ":" + self.header(fields) + "\n" + "\n".join(rows)
++                        + "\n" + close + "]")
++            if all(not isinstance(x, (dict, list, tuple)) and
++                   not (isinstance(x, str) and "\n" in x) for x in v):
++                joiner = "," if self.compact else ", "
++                flat = "[" + joiner.join(self.scalar(x, depth) for x in v) + "]"
++                if self.compact or len(flat) <= 72:
++                    return flat
++            if self.inline_width:
++                s = self.inline(v, depth)
++                if len(s) <= self.inline_width:
++                    return s
++            return ("[\n" + "\n".join(self.indent(inner, self.value(x, depth + 1)) for x in v)
++                    + "\n" + close + "]")
++        return self.scalar(v, depth)
++
++    def count(self, rows, inline=False):
++        if self.counts == "all" or (self.counts and not inline):
++            return str(len(rows))
++        return ""
++
++    def indent(self, pad, text):
++        """In compact mode, lines that don't start with a letter skip the indent:
++        tokenizers merge a leading space into words, but not into digits or symbols."""
++        if self.compact and not text[:1].isalpha():
++            return text
++        return pad + text
++
++    def members(self, d, depth):
++        return [f"{self.pad * depth}{self.key(k)}{self.kv}{self.value(v, depth)}"
++                for k, v in d.items()]
++
++
++# --------------------------------------------------------------------------
++# Public API
++# --------------------------------------------------------------------------
++
++def loads(text, env=False, max_depth=MAX_DEPTH, max_expansion=MAX_EXPANSION):
++    """Parse Jot (or JSON) text into Python objects.
++
++    env=True allows ${env:NAME} inside f-strings. max_depth and max_expansion
++    guard against hostile files.
++    """
++    if isinstance(text, (bytes, bytearray)):
++        text = bytes(text).decode("utf-8")
++    return _Parser(text, env, max_depth, max_expansion).parse_document()
++
++
++def load(fp, **kw):
++    """Parse Jot from an open file object."""
++    return loads(fp.read(), **kw)
++
++
++def dumps(obj, indent=2, compact=False, tables=True, bare=True, native_dates=False,
++          inline_width=None, counts=True, balanced=False):
++    """Serialise Python objects to Jot text.
++
++    compact=True       fewest tokens, for LLM prompts (1-space indent, small objects
++                       and lists on one line, nested values inside table cells)
++    balanced=True      compact, but every cell holds a single value and objects are
++                       never squeezed onto one line; easier for small models to read
++                       nested data, at a small token cost
++    tables=False       never use tables
++    bare=False         always quote strings
++    native_dates=True  write date-like *strings* unquoted when Jot -> JSON gives the
++                       identical string back (used when converting from JSON)
++    counts=True        declare row counts on multi-line tables ([20:...) so a reader
++                       can tell if rows went missing; "all" also on one-line tables;
++                       False for none
++    A top-level dict is written without braces.
++    """
++    if balanced:
++        compact = True
++        inline_width = 0
++    if compact:
++        indent = 1
++    if inline_width is None:
++        inline_width = 100 if compact else 0
++    w = _Writer(indent, bare, tables, compact, native_dates, inline_width, counts,
++                nested_cells=compact and not balanced)
++    if isinstance(obj, dict):
++        if not obj:
++            return "{}\n"
++        if w.table_shape(list(obj.values())) is None:
++            return "\n".join(w.members(obj, 0)) + "\n"
++    if isinstance(obj, str):
++        return json.dumps(obj, ensure_ascii=False) + "\n"
++    return w.value(obj, 0) + "\n"
++
++
++def dump(obj, fp, **kw):
++    fp.write(dumps(obj, **kw))
++
++
++def _json_default(o):
++    if isinstance(o, (_dt.datetime, _dt.date)):
++        return _dt_text(o)
++    if isinstance(o, _dt.timedelta):
++        secs = o / _dt.timedelta(seconds=1)
++        return int(secs) if secs == int(secs) else secs
++    raise TypeError(f"not JSON serialisable: {type(o).__name__}")
++
++
++def to_json(text, indent=2, env=False):
++    """Convert Jot text to JSON text. Dates become ISO strings, durations seconds."""
++    return json.dumps(loads(text, env=env), indent=indent, ensure_ascii=False,
++                      default=_json_default, allow_nan=False)
++
++
++def from_json(text, indent=2, compact=False, balanced=False):
++    """Convert JSON text to Jot text. Converting back with to_json gives the same JSON."""
++    return dumps(json.loads(text), indent=indent, compact=compact, balanced=balanced,
++                 native_dates=True)
++
++
++# --------------------------------------------------------------------------
++# Command line
++# --------------------------------------------------------------------------
++
++def _read(path):
++    if path == "-":
++        data = sys.stdin.buffer.read()
++    else:
++        with open(path, "rb") as f:
++            data = f.read()
++    try:
++        return data.decode("utf-8")
++    except UnicodeDecodeError as e:
++        raise SystemExit(f"{path}: not valid UTF-8 (byte {e.start})")
++
++
++def _write(path, text):
++    if not text.endswith("\n"):
++        text += "\n"
++    if path:
++        with open(path, "w", encoding="utf-8", newline="\n") as f:
++            f.write(text)
++    else:
++        sys.stdout.write(text)
++
++
++def _token_counter():
++    try:
++        import tiktoken
++        enc = tiktoken.get_encoding("o200k_base")
++        enc.encode("ok")
++        return (lambda t: len(enc.encode(t))), "o200k_base"
++    except Exception:
++        return None, None
++
++
++def _cmd_tokens(path):
++    text = _read(path)
++    try:
++        data, from_json_input = json.loads(text), True
++    except ValueError:
++        data, from_json_input = loads(text), False
++    variants = [
++        ("JSON (indent 2)", json.dumps(data, indent=2, ensure_ascii=False, default=_json_default)),
++        ("JSON (minified)", json.dumps(data, separators=(",", ":"), ensure_ascii=False,
++                                       default=_json_default)),
++        ("Jot", dumps(data, native_dates=from_json_input)),
++        ("Jot (balanced)", dumps(data, balanced=True, native_dates=from_json_input)),
++        ("Jot (compact)", dumps(data, compact=True, native_dates=from_json_input)),
++    ]
++    count, name = _token_counter()
++    base = None
++    print(f"{'format':18}{'chars':>10}{'tokens':>10}{'vs JSON':>10}")
++    for label, text in variants:
++        n = count(text) if count else len(text)
++        base = base or n
++        tok = f"{n:>10}" if count else f"{'-':>10}"
++        change = f"{(n / base - 1) * 100:+.0f}%" if label != variants[0][0] else ""
++        print(f"{label:18}{len(text):>10}{tok}{change:>10}")
++    if count:
++        print(f"\ntokens counted with tiktoken {name} (GPT-4o); other tokenizers differ slightly")
++    else:
++        print("\n'vs JSON' compares characters. For token counts: pip install tiktoken")
++    return 0
++
++
++def main(argv=None):
++    p = argparse.ArgumentParser(prog="jot", description="Jot: JSON for everyday files.")
++    p.add_argument("--version", action="version", version=f"jot {__version__}")
++    sub = p.add_subparsers(dest="cmd", required=True)
++
++    c = sub.add_parser("check", help="validate one or more .jot files")
++    c.add_argument("files", nargs="+")
++    c.add_argument("--env", action="store_true", help="allow ${env:NAME} in f-strings")
++
++    t = sub.add_parser("to-json", help="convert a .jot file to JSON")
++    f = sub.add_parser("from-json", help="convert a JSON file to .jot")
++    for sp in (t, f):
++        sp.add_argument("file", help="input file, or - for stdin")
++        sp.add_argument("-o", "--output", help="output file (default: stdout)")
++        sp.add_argument("--indent", type=int, default=2)
++    t.add_argument("--env", action="store_true", help="allow ${env:NAME} in f-strings")
++    f.add_argument("--compact", action="store_true", help="fewest tokens (for LLM prompts)")
++    f.add_argument("--balanced", action="store_true",
++                   help="compact, but one value per table cell (safer for small models)")
++
++    k = sub.add_parser("tokens", help="compare token counts of JSON vs Jot for a file")
++    k.add_argument("file")
++
++    a = p.parse_args(argv)
++
++    try:
++        if a.cmd == "check":
++            bad = 0
++            for path in a.files:
++                try:
++                    loads(_read(path), env=a.env)
++                    print(f"{path}: ok")
++                except JotError as e:
++                    bad += 1
++                    print(f"{path}: {e}", file=sys.stderr)
++            return 1 if bad else 0
++        if a.cmd == "tokens":
++            return _cmd_tokens(a.file)
++        text = _read(a.file)
++        if a.cmd == "to-json":
++            out = to_json(text, a.indent, env=a.env)
++        else:
++            out = from_json(text, a.indent, compact=a.compact, balanced=a.balanced)
++    except JotError as e:
++        print(f"{a.file}: {e}", file=sys.stderr)
++        return 1
++    except json.JSONDecodeError as e:
++        print(f"{a.file}: invalid JSON: {e}", file=sys.stderr)
++        return 1
++    _write(a.output, out)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/benchmarks/scripts/accuracy-benchmark.ts b/benchmarks/scripts/accuracy-benchmark.ts
+index a3748de..5b1a8ca 100644
+--- a/benchmarks/scripts/accuracy-benchmark.ts
++++ b/benchmarks/scripts/accuracy-benchmark.ts
+@@ -22,11 +22,15 @@ const RATE_LIMIT_INTERVAL_MS = 60_000
+ prompts.intro('Retrieval Accuracy Benchmark')
+ 
+ /** Generate evaluation tasks for a model */
++// Optional filter, e.g. BENCH_FORMATS=toon,jot,json-compact, to limit cost.
++const ONLY_FORMATS = process.env.BENCH_FORMATS?.split(',').map(s => s.trim()).filter(Boolean)
++const ACTIVE_FORMATS = Object.values(FORMATS).filter(f => !ONLY_FORMATS || ONLY_FORMATS.includes(f.name))
++
+ function generateEvaluationTasks(questions: Question[]): { question: Question, format: Format }[] {
+   const tasks: { question: Question, format: Format }[] = []
+ 
+   for (const question of questions) {
+-    for (const format of Object.values(FORMATS)) {
++    for (const format of ACTIVE_FORMATS) {
+       const dataset = ACCURACY_DATASETS.find(d => d.name === question.dataset)
+       if (format.name === 'csv' && dataset && !supportsCSV(dataset))
+         continue
+@@ -107,7 +111,7 @@ if (DRY_RUN && DRY_RUN_LIMITS.maxQuestions) {
+ }
+ 
+ prompts.log.info(`Evaluating ${questions.length} questions`)
+-prompts.log.info(`Testing ${Object.keys(FORMATS).length} formats`)
++prompts.log.info(`Testing ${ACTIVE_FORMATS.length} formats: ${ACTIVE_FORMATS.map(f => f.name).join(', ')}`)
+ 
+ // Evaluate each model separately and save its results before moving on, so an
+ // interrupted run keeps what it already paid for.
+diff --git a/benchmarks/scripts/jot-check.ts b/benchmarks/scripts/jot-check.ts
+new file mode 100644
+index 0000000..277a34e
+--- /dev/null
++++ b/benchmarks/scripts/jot-check.ts
+@@ -0,0 +1,49 @@
++import { execFileSync } from 'node:child_process'
++import { ACCURACY_DATASETS } from '../src/datasets.ts'
++import { FORMATS, supportsCSV } from '../src/formats.ts'
++import { generateQuestions } from '../src/questions/index.ts'
++import { encodeDataset } from '../src/structural-corruption.ts'
++import { tokenize } from '../src/utils.ts'
++import * as path from 'node:path'
++import * as url from 'node:url'
++
++const JOT_PY_PATH = process.env.JOT_PY ?? path.join(path.dirname(url.fileURLToPath(import.meta.url)), '..', 'jot', 'jot.py')
++
++const names = Object.keys(FORMATS)
++const totals: Record<string, number> = Object.fromEntries(names.map(n => [n, 0]))
++console.log('dataset'.padEnd(40) + names.map(n => n.padStart(13)).join(''))
++for (const d of ACCURACY_DATASETS) {
++  const row: string[] = []
++  for (const n of names) {
++    if (n === 'csv' && !supportsCSV(d)) { row.push('-'.padStart(13)); continue }
++    const text = encodeDataset(FORMATS[n]!, d)
++    const t = tokenize(text); totals[n]! += t; row.push(String(t).padStart(13))
++    if (n.startsWith('jot')) {
++      let verdict: string
++      try {
++        const back = JSON.parse(execFileSync(process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3'), [JOT_PY_PATH, 'to-json', '-'], { input: text, encoding: 'utf8' }))
++        verdict = JSON.stringify(back) === JSON.stringify(d.data) ? 'parses back to identical JSON' : 'PARSES BUT DIFFERS'
++      } catch (e: any) {
++        verdict = 'parser rejects: ' + String(e.stderr).split('\n')[0]!.replace(/^-: /, '')
++      }
++      if (d.corruption || verdict !== 'parses back to identical JSON') console.log(`   [${n}] ${d.name}: ${verdict}`)
++    }
++  }
++  console.log(d.name.padEnd(40) + row.join(''))
++}
++console.log('TOTAL'.padEnd(40) + names.map(n => String(totals[n]).padStart(13)).join(''))
++const qs = generateQuestions()
++console.log(`\n${qs.length} questions; tasks per model = ${qs.length} x formats (CSV only where supported)`)
++
++// Input-token estimate per format for a full run (one prompt per question)
++const perFormat: Record<string, number> = {}
++for (const q of qs) {
++  const d = ACCURACY_DATASETS.find(x => x.name === q.dataset)!
++  for (const n of names) {
++    if (n === 'csv' && !supportsCSV(d)) continue
++    perFormat[n] = (perFormat[n] ?? 0) + tokenize(encodeDataset(FORMATS[n]!, d)) + 120
++  }
++}
++console.log('\nestimated input tokens per model for a full run (data + ~120 tokens of prompt):')
++for (const [n, t] of Object.entries(perFormat)) console.log('  ' + n.padEnd(14) + t.toLocaleString('en-US').padStart(12))
++console.log('  ' + 'ALL'.padEnd(14) + Object.values(perFormat).reduce((a, b) => a + b, 0).toLocaleString('en-US').padStart(12))
+diff --git a/benchmarks/scripts/token-efficiency-benchmark.ts b/benchmarks/scripts/token-efficiency-benchmark.ts
+index ba43a07..f8105f6 100644
+--- a/benchmarks/scripts/token-efficiency-benchmark.ts
++++ b/benchmarks/scripts/token-efficiency-benchmark.ts
+@@ -29,7 +29,7 @@ const DATASET_ICONS: Record<string, string> = {
+   'nested-config': '🧩',
+ }
+ 
+-const COMPARISON_FORMAT_ORDER = ['json-pretty', 'json-compact', 'yaml', 'xml'] as const
++const COMPARISON_FORMAT_ORDER = ['jot', 'jot-balanced', 'jot-readable', 'json-pretty', 'json-compact', 'yaml', 'xml'] as const
+ 
+ const PROGRESS_BAR_WIDTH = 20
+ const TOKEN_PADDING = 7
+diff --git a/benchmarks/src/formats.ts b/benchmarks/src/formats.ts
+index 2799d79..3f279e4 100644
+--- a/benchmarks/src/formats.ts
++++ b/benchmarks/src/formats.ts
+@@ -1,4 +1,8 @@
+ import type { Dataset } from './types.ts'
++import { execFileSync } from 'node:child_process'
++import * as path from 'node:path'
++import process from 'node:process'
++import * as url from 'node:url'
+ import { stringify as stringifyCSV } from 'csv-stringify/sync'
+ import { XMLBuilder } from 'fast-xml-parser'
+ import { stringify as stringifyYAML } from 'yaml'
+@@ -18,6 +22,33 @@ export interface Format {
+   displayName: string
+ }
+ 
++/** Neutral parse hint for Jot, kept to the same length and style as TOON's. */
++const JOT_PRIMER = 'Jot: JSON-like; unquoted values are strings. Tables: key:[N:f1,f2 then one row per line (or ;-separated), cells in header order, ] closes; N is the declared row count. Empty cell = field absent. Keyed maps use {N:fields with one `entrykey:values` row per entry. A header field f{a,b} spans a nested object. Cells may hold inline values like [:a,b;1,2;3,4].'
++
++const JOT_PY = process.env.JOT_PY ?? path.join(path.dirname(url.fileURLToPath(import.meta.url)), '..', 'jot', 'jot.py')
++const PYTHON = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3')
++const jotCache = new Map<string, string>()
++
++/**
++ * Encodes data as Jot by calling the Python reference implementation
++ * (`jot from-json`), so the benchmark measures exactly what users get.
++ * Results are cached because the harness re-encodes datasets per question.
++ */
++function encodeJot(data: unknown, mode: 'compact' | 'balanced' | 'readable'): string {
++  const json = JSON.stringify(data)
++  const key = `${mode}:${json}`
++  const cached = jotCache.get(key)
++  if (cached !== undefined)
++    return cached
++
++  const args = [JOT_PY, 'from-json', '-']
++  if (mode !== 'readable')
++    args.push(`--${mode}`)
++  const out = execFileSync(PYTHON, args, { input: json, encoding: 'utf8', maxBuffer: 1 << 28 }).replace(/\n$/, '')
++  jotCache.set(key, out)
++  return out
++}
++
+ /**
+  * Format descriptor registry.
+  *
+@@ -48,6 +79,27 @@ export const FORMATS: Record<string, Format> = {
+     fence: 'toon',
+     displayName: 'TOON',
+   },
++  'jot': {
++    name: 'jot',
++    encode: data => encodeJot(data, 'compact'),
++    primer: JOT_PRIMER,
++    fence: 'jot',
++    displayName: 'Jot',
++  },
++  'jot-balanced': {
++    name: 'jot-balanced',
++    encode: data => encodeJot(data, 'balanced'),
++    primer: JOT_PRIMER,
++    fence: 'jot',
++    displayName: 'Jot balanced',
++  },
++  'jot-readable': {
++    name: 'jot-readable',
++    encode: data => encodeJot(data, 'readable'),
++    primer: JOT_PRIMER,
++    fence: 'jot',
++    displayName: 'Jot readable',
++  },
+   'csv': {
+     name: 'csv',
+     encode: data => toCSV(data),
+diff --git a/benchmarks/src/structural-corruption.ts b/benchmarks/src/structural-corruption.ts
+index b4460cd..145419b 100644
+--- a/benchmarks/src/structural-corruption.ts
++++ b/benchmarks/src/structural-corruption.ts
+@@ -101,6 +101,16 @@ function splitRecords(formatName: string, text: string): RecordSplit {
+     }
+   }
+ 
++  if (formatName.startsWith('jot')) {
++    // Structure is `employees:[N:fields` / one row per line / `]`
++    const { body, tailLines } = peelTrailingBlankLines(lines.slice(1))
++    return {
++      headLines: [lines[0]!],
++      recordBlocks: body.slice(0, -1).map(line => [line]),
++      tailLines: [body[body.length - 1]!, ...tailLines],
++    }
++  }
++
+   if (formatName === 'csv') {
+     return {
+       headLines: [lines[0]!, lines[1]!],
+@@ -181,6 +191,11 @@ function fieldIndexFromHeader(formatName: string, headLines: string[], fieldName
+     return fields.indexOf(fieldName)
+   }
+ 
++  if (formatName.startsWith('jot')) {
++    const fields = headLines[0]!.replace(/^.*?[[{]\d*:/, '').split(',')
++    return fields.indexOf(fieldName)
++  }
++
+   // CSV column header row
+   return headLines[1]!.split(',').indexOf(fieldName)
+ }
+@@ -209,7 +224,7 @@ function dropFieldFromRecords(
+   fieldName: string,
+ ): string {
+   const split = splitRecords(formatName, text)
+-  const isSingleLine = formatName === 'toon' || formatName === 'csv'
++  const isSingleLine = formatName === 'toon' || formatName === 'csv' || formatName.startsWith('jot')
+   const targets = new Set(recordIndices)
+ 
+   split.recordBlocks = split.recordBlocks.map((block, index) => {

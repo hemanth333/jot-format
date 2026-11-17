@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jot-format"
+version = "0.1.0"
+description = "Jot: a JSON-compatible format that's easier to write by hand and uses fewer tokens in LLM prompts"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hemanth Rudra" }]
+keywords = ["json", "config", "serialization", "llm", "tokens", "format"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Text Processing :: Markup",
+]
+
+[project.urls]
+Homepage = "https://github.com/hemanth333/jot-format"
+Repository = "https://github.com/hemanth333/jot-format"
+Issues = "https://github.com/hemanth333/jot-format/issues"
+Changelog = "https://github.com/hemanth333/jot-format/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+tokens = ["tiktoken"]
+
+[project.scripts]
+jot = "jot:main"
+
+[tool.setuptools]
+py-modules = ["jot"]

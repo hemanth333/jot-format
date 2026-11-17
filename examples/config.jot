@@ -1,0 +1,43 @@
+# example.jot: a typical day-to-day config file
+
+name: my-tool                # plain text needs no quotes
+version: "1.4.2"             # ...unless it looks like something else (a number here)
+released: 2026-11-17         # native date
+
+# define once, reuse below (references don't appear in the output)
+&api: https://api.example.com/v2
+&http_defaults: { retries: 3, timeout: 30s, max_body: 10MB }
+
+endpoints: {
+  users: f"${api}/users"
+  orders: f"${api}/orders"
+}
+
+http: {
+  ...*http_defaults          # copy the defaults,
+  timeout: 1m30s             # then override one
+}
+
+paths: {
+  logs: C:\Users\me\AppData\Local\my-tool\logs
+  cache: ~/.cache/my-tool
+}
+
+# a table: field names once, then one row per item
+servers: [:name,host,port,region,primary
+  alpha,"10.0.0.1",8080,ap-south-1,true    # IPs start with digits, so they need quotes
+  beta,"10.0.0.2",8080,ap-south-1,false
+  gamma,"10.0.0.3",9090,eu-west-1,         # empty cell = field not set
+]
+
+file_mode: 0o644
+
+welcome: """
+  Hello!
+  This text keeps its line breaks, \
+  and this line is joined to the one above.
+  """
+
+/* features under test:
+   flip these freely */
+features: { dark_mode: true, beta: false }

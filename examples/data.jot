@@ -1,0 +1,10 @@
+service: checkout
+users: [3:id,name,role,active,joined,note
+  1,Asha Rao,admin,true,2025-02-27,
+  2,Ravi Kumar,viewer,false,2025-04-02,
+  3,Meera Iyer,editor,true,2025-07-02,on leave
+]
+flags: {2:enabled,rollout
+  dark_mode: true,80
+  new_checkout: false,0
+}
